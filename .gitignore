@@ -1,0 +1,9 @@
+node_modules/
+*.gguf
+*.gguf.etag
+*.exe
+*.log
+.claude/
+proxy-debug.log
+test.txt
+command.txt

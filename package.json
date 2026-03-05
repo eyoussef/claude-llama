@@ -1,0 +1,28 @@
+{
+  "name": "claude-llama",
+  "version": "5.0.0",
+  "description": "Run Claude Code CLI with local llama.cpp models — zero API costs",
+  "main": "llama-shim.js",
+  "bin": {
+    "claude-llama": "./llama-shim.js"
+  },
+  "scripts": {
+    "start": "node llama-shim.js"
+  },
+  "keywords": [
+    "claude",
+    "claude-code",
+    "llama.cpp",
+    "llama",
+    "local-llm",
+    "anthropic",
+    "proxy",
+    "ai",
+    "gguf"
+  ],
+  "author": "",
+  "license": "MIT",
+  "engines": {
+    "node": ">=16.0.0"
+  }
+}
