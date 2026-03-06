@@ -177,10 +177,14 @@ Including: streaming events, tool/function calls, tool results, stop reasons, an
 
 | Feature | What it does |
 |---------|-------------|
-| **ToolSearch interception** | Overrides model's ToolSearch query to always discover Write/Read/Edit/Bash |
+| **Auto ToolSearch init** | Synthesizes a ToolSearch call on first request to load all deferred tools (no LLM call) |
+| **ToolSearch interception** | Overrides model's ToolSearch query to discover Write/Read/Edit/Bash/WebSearch/WebFetch |
+| **Smart tool selection** | Only shows WebSearch/WebFetch when user asks for web stuff — fewer tools = better decisions |
+| **Path correction** | Buffers Write/Edit/Bash calls and auto-fixes wrong file paths to the working directory |
+| **Nudge system** | After 4+ non-Write tools, injects "STOP exploring, use Write NOW" to prevent loops |
 | **Auto-save** | When model outputs code as text, auto-creates a Write tool call so Claude CLI prompts to save |
 | **`<think>` stripping** | Removes Qwen3/DeepSeek `<think>...</think>` reasoning blocks, shows only the answer |
-| **Loop breaker** | Detects repeated tool calls and forces text response after 1 successful Write |
+| **Loop breaker** | Forces text summary after successful Write; hard stop at 15 consecutive tools |
 | **Schema simplification** | Strips verbose tool schemas to minimal params so small models don't choke |
 | **MCP filter** | Removes MCP server tools (HuggingFace etc.) that small models misuse |
 
@@ -199,15 +203,25 @@ LLAMA_CPP_URL=http://192.168.1.100:8080 SHIM_PORT=9000 node llama-shim.js
 
 ## Recommended Models
 
-| Model | Size | Good for | Context | Command |
-|-------|------|----------|---------|---------|
-| Qwen3.5-0.8B | 0.9 GB | Quick tasks, simple code | 262K | `-hf unsloth/Qwen3.5-0.8B-GGUF:Q8_0` |
-| Qwen3-4B | 4.5 GB | Balanced speed/quality | 128K | `-hf unsloth/Qwen3-4B-GGUF:Q8_0` |
-| Qwen3-8B | 8.5 GB | Best quality for most tasks | 128K | `-hf unsloth/Qwen3-8B-GGUF:Q8_0` |
-| Qwen2.5-Coder-7B | 7.7 GB | Code-focused tasks | 128K | `-hf unsloth/Qwen2.5-Coder-7B-Instruct-GGUF:Q8_0` |
-| DeepSeek-R1-8B | 8.5 GB | Complex reasoning | 128K | `-hf unsloth/DeepSeek-R1-Distill-Qwen-8B-GGUF:Q8_0` |
+### Qwen3.5 Family (Recommended)
 
-> **Note:** Larger models (8B+) handle tool calling much more reliably. The 0.8B model works but needs the shim's guardrails (auto-save, loop detection, ToolSearch interception).
+The **Qwen3.5** series is the recommended model family — multimodal, strong tool-calling, and available from tiny to large:
+
+| Model | Size (Q8_0) | Good for | Context | Command |
+|-------|-------------|----------|---------|---------|
+| Qwen3.5-0.8B | ~0.9 GB | Quick tasks, simple code, low RAM | 262K | `-hf unsloth/Qwen3.5-0.8B-GGUF:Q8_0` |
+| Qwen3.5-2B | ~2.3 GB | Light coding, faster responses | 262K | `-hf unsloth/Qwen3.5-2B-GGUF:Q8_0` |
+| Qwen3.5-4B | ~4.5 GB | Balanced speed/quality | 262K | `-hf unsloth/Qwen3.5-4B-GGUF:Q8_0` |
+| Qwen3.5-9B | ~9.5 GB | Best quality, reliable tool use | 262K | `-hf unsloth/Qwen3.5-9B-GGUF:Q8_0` |
+
+### Other Compatible Models
+
+| Model | Size (Q8_0) | Good for | Context | Command |
+|-------|-------------|----------|---------|---------|
+| Qwen2.5-Coder-7B | ~7.7 GB | Code-focused tasks | 128K | `-hf unsloth/Qwen2.5-Coder-7B-Instruct-GGUF:Q8_0` |
+| DeepSeek-R1-8B | ~8.5 GB | Complex reasoning | 128K | `-hf unsloth/DeepSeek-R1-Distill-Qwen-8B-GGUF:Q8_0` |
+
+> **Note:** Larger models (4B+) handle tool calling much more reliably. The 0.8B model works but needs the shim's guardrails (auto-save, loop detection, nudge system, path correction). For the best experience, use **Qwen3.5-9B** or higher.
 
 ## Quantization Guide
 
@@ -279,12 +293,11 @@ claude-llama/
 ## How Tool Calling Works
 
 ```
-1. Claude CLI sends request with tools: [ToolSearch]
-2. Shim intercepts → overrides query to "select:Write,Read,Edit,Bash,Grep,Glob"
-3. Claude CLI discovers Write, Read, Edit, Bash tools
-4. Model calls Write(file_path, content) → Claude CLI shows permission prompt
-5. User accepts → file is saved
-6. Shim detects Write was used → forces text summary (prevents loop)
+1. First request → shim auto-synthesizes ToolSearch (no LLM call, instant)
+2. Claude CLI discovers Write, Read, Edit, Bash, WebSearch, WebFetch tools
+3. Model calls Write(file_path, content) → shim fixes path → Claude CLI shows permission prompt
+4. User accepts → file is saved
+5. Shim detects successful Write → forces text summary (prevents loop)
 ```
 
 If the model outputs code as plain text instead of using Write:
