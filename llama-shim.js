@@ -162,12 +162,13 @@ function translateRequest(body) {
 
     systemText += `\n\nWORKING DIRECTORY: ${wd}\nThis directory already exists. Do NOT run mkdir.\n\n` +
         'RULES:\n' +
-        `1. To create a file: IMMEDIATELY call Write tool. file_path="${wd}/FILENAME". content=the full file.\n` +
-        '2. Do NOT run ls, pwd, mkdir, or Read before creating files. The directory exists.\n' +
-        '3. Do NOT use Bash to create files. Use the Write tool.\n' +
-        '4. NEVER output code as text. Always use Write tool.\n' +
-        '5. Edit tool: file_path, old_string, new_string.\n' +
-        '6. Keep responses SHORT. Act first, explain after.';
+        '1. For QUESTIONS (what, how, why, etc.): answer with text. Do NOT create files for questions.\n' +
+        `2. For CREATE/BUILD requests: use Write tool. file_path="${wd}/FILENAME". content=the full file.\n` +
+        '3. Do NOT run ls, pwd, mkdir before creating files. The directory exists.\n' +
+        '4. Do NOT use Bash to create files. Use the Write tool.\n' +
+        '5. NEVER output large code as text. Use Write tool for code files.\n' +
+        '6. Edit tool: file_path, old_string, new_string.\n' +
+        '7. Keep responses SHORT. Act first, explain after.';
     messages.push({ role: 'system', content: systemText.trim() });
 
     for (const msg of body.messages || []) {
@@ -268,12 +269,28 @@ function translateRequest(body) {
     const writeCount = recentToolNames.filter(n => n === 'Write').length;
     const lastToolName = recentToolNames[0];
 
-    // NUDGE: After 4+ non-Write tools, strongly push model to use Write
-    if (consecutiveToolCalls >= 4 && writeCount === 0 && !lastToolFailed) {
+    // Detect user intent from last user message
+    const userMsgsAll = (body.messages || []).filter(m => m.role === 'user');
+    const lastUserContent = userMsgsAll.length > 0 ? (typeof userMsgsAll[userMsgsAll.length - 1].content === 'string'
+        ? userMsgsAll[userMsgsAll.length - 1].content
+        : Array.isArray(userMsgsAll[userMsgsAll.length - 1].content)
+            ? userMsgsAll[userMsgsAll.length - 1].content.filter(p => p.type === 'text').map(p => p.text).join(' ') : '') : '';
+    const wantsCreate = /\b(create|make|build|generate|write|add|implement|develop|setup|init)\b/i.test(lastUserContent);
+    const isQuestion = /^(what|how|why|when|where|who|which|is|are|can|do|does|tell|show|explain|find|get|check)\b/i.test(lastUserContent.trim());
+
+    // NUDGE: Only push Write when user asked to CREATE something
+    if (consecutiveToolCalls >= 4 && writeCount === 0 && !lastToolFailed && wantsCreate && !isQuestion) {
         log(`  Nudging model to use Write (${consecutiveToolCalls} tools, 0 writes)`, 'yellow');
         messages.push({ role: 'user', content:
             `[SYSTEM: STOP exploring. You have all the information you need. ` +
             `Use the Write tool NOW to create the file. file_path="${wd}/FILENAME", content=the full file content.]`
+        });
+    }
+    // For questions: nudge to just respond with text
+    if (consecutiveToolCalls >= 4 && writeCount === 0 && isQuestion && !wantsCreate) {
+        log(`  Nudging model to answer with text (question detected)`, 'yellow');
+        messages.push({ role: 'user', content:
+            '[SYSTEM: You have enough information now. Answer the question with text. Do NOT create any files.]'
         });
     }
 
@@ -325,7 +342,7 @@ function translateRequest(body) {
                 : Array.isArray(m.content) ? m.content.filter(p => p.type === 'text').map(p => p.text).join(' ') : '';
             return txt + ' ' + c;
         }, '');
-        const wantsWeb = /\b(search|web|fetch|url|https?:|find online|look up|google|browse|internet|research)\b/i.test(lastUserText);
+        const wantsWeb = /\b(search|web|fetch|url|https?:|find online|look up|google|browse|internet|research|price|weather|news|today|latest|current|stock|crypto|bitcoin)\b/i.test(lastUserText);
 
         const CORE_TOOLS = ['Write', 'Read', 'Edit', 'Bash', 'ToolSearch'];
         if (wantsWeb) {
