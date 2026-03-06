@@ -152,24 +152,23 @@ function translateRequest(body) {
             ? body.system
             : body.system.filter(s => s.type === 'text').map(s => s.text).join(' ');
     }
-    systemText += '\n\nCRITICAL RULES:\n' +
-        '1. FIRST STEP: Call ToolSearch with query "select:Write,Read,Edit,Bash,Grep,Glob" to load file tools.\n' +
-        '2. NEVER paste large code as text. ALWAYS write code to files using the Write tool or Bash tool.\n' +
-        '3. To create a file: use Write tool with file_path and content parameters.\n' +
-        '4. To edit a file: use Edit tool with file_path, old_string, and new_string parameters.\n' +
-        '5. To read a file: use Read tool with file_path parameter.\n' +
-        '6. To run commands: use Bash tool with command parameter.\n' +
-        '7. Do NOT use WebFetch unless user explicitly asks to fetch a URL.\n' +
-        '8. Keep text responses SHORT. Explain briefly what you will do, then use tools.\n' +
-        '9. When updating code: use Edit tool to change specific parts, or Write tool to rewrite the whole file.';
-    messages.push({ role: 'system', content: systemText.trim() });
-
-    // Extract working directory from system prompt for path resolution
+    // Extract working directory from system prompt FIRST
     let workDir = '';
     if (systemText.includes('working directory:')) {
         const wdMatch = systemText.match(/working directory:\s*(\S+)/);
         if (wdMatch) workDir = wdMatch[1];
     }
+    const wd = workDir ? workDir.replace(/\\/g, '/') : 'C:/Users/pc/Desktop';
+
+    systemText += `\n\nWORKING DIRECTORY: ${wd}\n` +
+        'ALL files MUST be created inside this directory.\n\n' +
+        'RULES:\n' +
+        `1. To create a file: IMMEDIATELY call Write with file_path="${wd}/FILENAME" and content. No ls, no pwd, no Read first.\n` +
+        '2. NEVER output code as text. Always use Write tool.\n' +
+        '3. Edit tool: file_path, old_string, new_string.\n' +
+        '4. Bash tool: command. For running programs, installing packages, etc.\n' +
+        '5. Keep responses SHORT. Act first, explain after.';
+    messages.push({ role: 'system', content: systemText.trim() });
 
     for (const msg of body.messages || []) {
         if (Array.isArray(msg.content)) {
@@ -217,10 +216,11 @@ function translateRequest(body) {
         _workDir: workDir
     };
 
-    // Detect tool call loops and duplicate writes
+    // Detect tool call loops, errors, and duplicate writes
     let consecutiveToolCalls = 0;
     const recentToolNames = [];
     const writtenFiles = new Set();
+    let lastToolFailed = false;
     for (let i = body.messages.length - 1; i >= 0; i--) {
         const m = body.messages[i];
         const content = Array.isArray(m.content) ? m.content : [];
@@ -231,7 +231,6 @@ function translateRequest(body) {
             if (hasToolUse) {
                 for (const c of content.filter(c => c.type === 'tool_use')) {
                     recentToolNames.push(c.name);
-                    // Track files already written
                     if (c.name === 'Write' && c.input?.file_path) {
                         writtenFiles.add(c.input.file_path);
                     }
@@ -242,26 +241,85 @@ function translateRequest(body) {
         }
     }
 
+    // Only check the LAST message for errors (not the whole history — avoids false positives from ToolSearch results)
+    const lastMsg = body.messages[body.messages.length - 1];
+    const lastContent = Array.isArray(lastMsg?.content) ? lastMsg.content : [];
+    for (const c of lastContent.filter(c => c.type === 'tool_result')) {
+        // Skip ToolSearch results — they contain tool descriptions with words like "error"
+        if (c.tool_use_id && recentToolNames.includes('ToolSearch')) {
+            const toolUseMsg = body.messages.find(m =>
+                Array.isArray(m.content) && m.content.some(p => p.type === 'tool_use' && p.id === c.tool_use_id && p.name === 'ToolSearch'));
+            if (toolUseMsg) continue;
+        }
+        if (c.is_error) {
+            lastToolFailed = true;
+            break;
+        }
+        const resultText = typeof c.content === 'string' ? c.content
+            : Array.isArray(c.content) ? c.content.filter(p => p.type === 'text').map(p => p.text).join(' ') : '';
+        // Only match clear error patterns, not words in descriptions
+        if (/^error:|ENOENT|EACCES|EPERM|Invalid tool|not a valid|cannot find/i.test(resultText.trim())) {
+            lastToolFailed = true;
+            break;
+        }
+    }
+
     const toolSearchUsed = recentToolNames.includes('ToolSearch');
-
-    // After a successful Write, force text summary (prevents duplicate write loop)
     const writeCount = recentToolNames.filter(n => n === 'Write').length;
-    const forceTextResponse = writeCount >= 1 || consecutiveToolCalls >= 8;
+    const lastToolName = recentToolNames[0];
 
-    if (forceTextResponse) {
-        log(`  Forcing text response (${writeCount} writes, ${consecutiveToolCalls} consecutive tools)`, 'yellow');
-        // Strip all tools and tell model to summarize
+    // NUDGE: After 4+ non-Write tools, strongly push model to use Write
+    if (consecutiveToolCalls >= 4 && writeCount === 0 && !lastToolFailed) {
+        log(`  Nudging model to use Write (${consecutiveToolCalls} tools, 0 writes)`, 'yellow');
+        messages.push({ role: 'user', content:
+            `[SYSTEM: STOP exploring. You have all the information you need. ` +
+            `Use the Write tool NOW to create the file. file_path="${wd}/FILENAME", content=the full file content.]`
+        });
+    }
+
+    // PATH FIX hint for Write/Edit failures only
+    if (lastToolFailed && (lastToolName === 'Write' || lastToolName === 'Edit')) {
+        log(`  Last ${lastToolName} failed — injecting path hint`, 'yellow');
+        messages.push({ role: 'user', content:
+            `[SYSTEM: ${lastToolName} failed. Use exact path: "${wd}/FILENAME". Try again.]`
+        });
+    }
+
+    // FORCE TEXT only after successful Write (not after exploration with 0 writes)
+    const successfulWrites = writeCount > 0 && !lastToolFailed;
+    if (successfulWrites) {
+        log(`  Forcing text response (${writeCount} successful writes)`, 'yellow');
         const fileList = [...writtenFiles].map(f => path.basename(f)).join(', ');
         messages.push({ role: 'user', content:
-            `[SYSTEM: The files have been saved successfully (${fileList || 'done'}). ` +
-            'Now provide a brief summary of what you created. Do NOT call any more tools. Just respond with text.]'
+            `[SYSTEM: Files saved: ${fileList || 'done'}. Summarize briefly. Do NOT call more tools.]`
+        });
+        return req;
+    }
+
+    // HARD STOP at 15 consecutive tools with no writes — model is stuck
+    if (consecutiveToolCalls >= 15) {
+        log(`  Hard stop: ${consecutiveToolCalls} tools with no writes — forcing text`, 'red');
+        messages.push({ role: 'user', content:
+            '[SYSTEM: Too many tool calls without creating a file. Respond with text only and explain what happened.]'
         });
         return req;
     }
 
     if (body.tools && body.tools.length > 0) {
-        // Filter and simplify tools for small models
+        // Smart tool selection: only include web tools when user asks for web stuff
+        const userMsgs = (body.messages || []).filter(m => m.role === 'user');
+        const lastUserText = userMsgs.reduce((txt, m) => {
+            const c = typeof m.content === 'string' ? m.content
+                : Array.isArray(m.content) ? m.content.filter(p => p.type === 'text').map(p => p.text).join(' ') : '';
+            return txt + ' ' + c;
+        }, '');
+        const wantsWeb = /\b(search|web|fetch|url|https?:|find online|look up|google|browse|internet|research)\b/i.test(lastUserText);
+
         const CORE_TOOLS = ['Write', 'Read', 'Edit', 'Bash', 'ToolSearch'];
+        if (wantsWeb) {
+            CORE_TOOLS.push('WebSearch', 'WebFetch');
+            log(`  Web tools enabled (user requested web)`, 'cyan');
+        }
         const SIMPLE_SCHEMAS = {
             Write: { type: 'object', required: ['file_path', 'content'], properties: {
                 file_path: { type: 'string', description: 'Absolute path to file' },
@@ -278,13 +336,19 @@ function translateRequest(body) {
             Bash: { type: 'object', required: ['command'], properties: {
                 command: { type: 'string', description: 'Shell command to run' }
             }},
+            WebSearch: { type: 'object', required: ['query'], additionalProperties: false, properties: {
+                query: { type: 'string', description: 'Search query' }
+            }},
+            WebFetch: { type: 'object', required: ['url', 'prompt'], additionalProperties: false, properties: {
+                url: { type: 'string', description: 'URL to fetch' },
+                prompt: { type: 'string', description: 'What to extract from the page' }
+            }},
         };
 
         req.tools = body.tools
             .filter(t => {
                 if (t.name === 'ToolSearch' && toolSearchUsed) return false;
                 if (t.name.startsWith('mcp__')) return false;
-                // Only keep core tools to reduce schema size
                 if (!CORE_TOOLS.includes(t.name)) return false;
                 return true;
             })
@@ -292,7 +356,7 @@ function translateRequest(body) {
                 type: 'function',
                 function: {
                     name: t.name,
-                    description: t.description ? t.description.substring(0, 100) : '',
+                    description: t.description ? t.description.substring(0, 150) : '',
                     parameters: SIMPLE_SCHEMAS[t.name] || t.input_schema || { type: 'object', properties: {} }
                 }
             }));
@@ -469,6 +533,42 @@ function handleStreaming(openaiReq, anthropicReq, res) {
             emitAutoSaveToolCalls();
         }
 
+        // Flush buffered tool calls with path correction
+        const wdNorm = workDir ? workDir.replace(/\\/g, '/') : '';
+        for (const idx in toolCalls) {
+            if (toolCalls[idx]._buffered && toolCalls[idx].arguments) {
+                let args = toolCalls[idx].arguments;
+                try {
+                    const parsed = JSON.parse(args);
+                    if (parsed.file_path && wdNorm) {
+                        const fp = parsed.file_path.replace(/\\/g, '/');
+                        if (!fp.startsWith(wdNorm)) {
+                            const filename = path.basename(fp);
+                            parsed.file_path = wdNorm + '/' + filename;
+                            log(`  Path fix: ${fp} → ${parsed.file_path}`, 'yellow');
+                            args = JSON.stringify(parsed);
+                        }
+                    }
+                    // Fix paths in Bash commands too
+                    if (parsed.command && wdNorm && toolCalls[idx].name === 'Bash') {
+                        const cmd = parsed.command;
+                        // Replace wrong absolute paths pointing to /home/... or other wrong locations
+                        const badPathRe = /(?:\/home\/[^\s'"]*|\/tmp\/[^\s'"]*|\/root\/[^\s'"]*)([\w\-]+\.\w{1,10})/g;
+                        const fixed = cmd.replace(badPathRe, (match, filename) => wdNorm + '/' + filename);
+                        if (fixed !== cmd) {
+                            parsed.command = fixed;
+                            log(`  Bash path fix: ${cmd.substring(0, 60)} → ${fixed.substring(0, 60)}`, 'yellow');
+                            args = JSON.stringify(parsed);
+                        }
+                    }
+                } catch (e) { /* partial JSON, send as-is */ }
+                sse('content_block_delta', {
+                    type: 'content_block_delta', index: toolBlockIndices[idx],
+                    delta: { type: 'input_json_delta', partial_json: args }
+                });
+            }
+        }
+
         // Close model's tool call blocks
         for (const idx in toolCalls) {
             if (toolBlockIndices[idx] !== undefined) {
@@ -538,14 +638,14 @@ function handleStreaming(openaiReq, anthropicReq, res) {
                 // Intercept ToolSearch: override with correct query to discover file tools
                 if (name === 'ToolSearch' && !toolSearchIntercepted) {
                     toolSearchIntercepted = true;
-                    log(`  Intercepting ToolSearch → forcing "select:Write,Read,Edit,Bash,Grep,Glob"`, 'yellow');
+                    log(`  Intercepting ToolSearch → forcing "select:Write,Read,Edit,Bash,Grep,Glob,WebSearch,WebFetch"`, 'yellow');
                     toolCalls[idx] = { id: tc.id, name, arguments: '' };
                     toolBlockIndices[idx] = nextBlockIndex++;
                     sse('content_block_start', {
                         type: 'content_block_start', index: toolBlockIndices[idx],
                         content_block: { type: 'tool_use', id: tc.id, name, input: {} }
                     });
-                    const overrideArgs = '{"query":"select:Write,Read,Edit,Bash,Grep,Glob","max_results":5}';
+                    const overrideArgs = '{"query":"select:Write,Read,Edit,Bash,Grep,Glob,WebSearch,WebFetch","max_results":5}';
                     toolCalls[idx].arguments = overrideArgs;
                     sse('content_block_delta', {
                         type: 'content_block_delta', index: toolBlockIndices[idx],
@@ -558,6 +658,8 @@ function handleStreaming(openaiReq, anthropicReq, res) {
 
                 toolCalls[idx] = { id: tc.id, name, arguments: '' };
                 toolBlockIndices[idx] = nextBlockIndex++;
+                // Buffer file tools + Bash for path correction; stream others immediately
+                toolCalls[idx]._buffered = ['Write', 'Edit', 'Read', 'Bash'].includes(name);
                 sse('content_block_start', {
                     type: 'content_block_start', index: toolBlockIndices[idx],
                     content_block: { type: 'tool_use', id: tc.id, name, input: {} }
@@ -565,10 +667,12 @@ function handleStreaming(openaiReq, anthropicReq, res) {
             }
             if (tc.function?.arguments && toolCalls[idx] && !toolCalls[idx]._overridden) {
                 toolCalls[idx].arguments += tc.function.arguments;
-                sse('content_block_delta', {
-                    type: 'content_block_delta', index: toolBlockIndices[idx],
-                    delta: { type: 'input_json_delta', partial_json: tc.function.arguments }
-                });
+                if (!toolCalls[idx]._buffered) {
+                    sse('content_block_delta', {
+                        type: 'content_block_delta', index: toolBlockIndices[idx],
+                        delta: { type: 'input_json_delta', partial_json: tc.function.arguments }
+                    });
+                }
             }
         }
     }
@@ -707,6 +811,69 @@ async function handleNonStreaming(openaiReq, anthropicReq, res) {
     });
 }
 
+// --- Auto ToolSearch Init ---
+
+function needsToolSearchInit(messages) {
+    // Check if ToolSearch has already been called in this conversation
+    for (const msg of messages || []) {
+        const content = Array.isArray(msg.content) ? msg.content : [];
+        for (const c of content) {
+            if (c.type === 'tool_use' && c.name === 'ToolSearch') return false;
+        }
+    }
+    return true;
+}
+
+function synthesizeToolSearchResponse(res, model) {
+    const messageId = generateId('msg');
+    const toolId = generateId('toolu');
+
+    log('  Auto-init: synthesizing ToolSearch to load deferred tools (no LLM call)', 'yellow');
+
+    res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+        'X-Request-Id': messageId
+    });
+
+    function sse(eventType, obj) {
+        res.write(`event: ${eventType}\ndata: ${JSON.stringify(obj)}\n\n`);
+    }
+
+    sse('message_start', {
+        type: 'message_start',
+        message: { id: messageId, type: 'message', role: 'assistant', model: model || CONFIG.MODEL, content: [], stop_reason: null, usage: { input_tokens: 0, output_tokens: 0 }}
+    });
+
+    // Text block
+    sse('content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } });
+    sse('content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'Loading tools...' } });
+    sse('content_block_stop', { type: 'content_block_stop', index: 0 });
+
+    // ToolSearch tool_use block
+    sse('content_block_start', {
+        type: 'content_block_start', index: 1,
+        content_block: { type: 'tool_use', id: toolId, name: 'ToolSearch', input: {} }
+    });
+    const args = '{"query":"select:Write,Read,Edit,Bash,Grep,Glob,WebSearch,WebFetch","max_results":8}';
+    sse('content_block_delta', {
+        type: 'content_block_delta', index: 1,
+        delta: { type: 'input_json_delta', partial_json: args }
+    });
+    sse('content_block_stop', { type: 'content_block_stop', index: 1 });
+
+    // Stop with tool_use reason
+    sse('message_delta', {
+        type: 'message_delta', delta: { stop_reason: 'tool_use', stop_sequence: null }, usage: { output_tokens: 5 }
+    });
+    sse('message_stop', { type: 'message_stop' });
+    res.write('data: [DONE]\n\n');
+    res.end();
+
+    log('  ToolSearch init sent — Claude Code will load tools and come back', 'green');
+}
+
 // --- Server ---
 
 function startServer() {
@@ -745,6 +912,14 @@ function startServer() {
                 req.on('end', async () => {
                     try {
                         const anthropicReq = JSON.parse(body);
+
+                        // Auto-init: load deferred tools on first request (no LLM call needed)
+                        if (needsToolSearchInit(anthropicReq.messages) && anthropicReq.stream !== false) {
+                            log(`Request: ${anthropicReq.messages?.length} msgs (first request — auto-init ToolSearch)`);
+                            synthesizeToolSearchResponse(res, anthropicReq.model);
+                            return;
+                        }
+
                         const openaiReq = translateRequest(anthropicReq);
 
                         const totalChars = anthropicReq.messages?.reduce((sum, m) => {
