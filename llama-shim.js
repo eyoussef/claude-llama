@@ -160,14 +160,14 @@ function translateRequest(body) {
     }
     const wd = workDir ? workDir.replace(/\\/g, '/') : 'C:/Users/pc/Desktop';
 
-    systemText += `\n\nWORKING DIRECTORY: ${wd}\n` +
-        'ALL files MUST be created inside this directory.\n\n' +
+    systemText += `\n\nWORKING DIRECTORY: ${wd}\nThis directory already exists. Do NOT run mkdir.\n\n` +
         'RULES:\n' +
-        `1. To create a file: IMMEDIATELY call Write with file_path="${wd}/FILENAME" and content. No ls, no pwd, no Read first.\n` +
-        '2. NEVER output code as text. Always use Write tool.\n' +
-        '3. Edit tool: file_path, old_string, new_string.\n' +
-        '4. Bash tool: command. For running programs, installing packages, etc.\n' +
-        '5. Keep responses SHORT. Act first, explain after.';
+        `1. To create a file: IMMEDIATELY call Write tool. file_path="${wd}/FILENAME". content=the full file.\n` +
+        '2. Do NOT run ls, pwd, mkdir, or Read before creating files. The directory exists.\n' +
+        '3. Do NOT use Bash to create files. Use the Write tool.\n' +
+        '4. NEVER output code as text. Always use Write tool.\n' +
+        '5. Edit tool: file_path, old_string, new_string.\n' +
+        '6. Keep responses SHORT. Act first, explain after.';
     messages.push({ role: 'system', content: systemText.trim() });
 
     for (const msg of body.messages || []) {
@@ -277,11 +277,23 @@ function translateRequest(body) {
         });
     }
 
-    // PATH FIX hint for Write/Edit failures only
-    if (lastToolFailed && (lastToolName === 'Write' || lastToolName === 'Edit')) {
+    // Count consecutive Write failures
+    const failedWriteCount = recentToolNames.filter(n => n === 'Write').length;
+    const bashWriteCount = recentToolNames.filter(n => n === 'Bash').length;
+
+    // PATH FIX hint for first Write/Edit failure only
+    if (lastToolFailed && (lastToolName === 'Write' || lastToolName === 'Edit') && failedWriteCount <= 1) {
         log(`  Last ${lastToolName} failed — injecting path hint`, 'yellow');
         messages.push({ role: 'user', content:
             `[SYSTEM: ${lastToolName} failed. Use exact path: "${wd}/FILENAME". Try again.]`
+        });
+    }
+
+    // After 2+ failed Writes: stop retrying, use Bash as fallback
+    if (lastToolFailed && failedWriteCount >= 2) {
+        log(`  Write failed ${failedWriteCount} times — switching to Bash fallback`, 'red');
+        messages.push({ role: 'user', content:
+            `[SYSTEM: Write tool keeps failing. Use Bash instead: cat > "${wd}/FILENAME" << 'ENDOFFILE'\n...content...\nENDOFFILE\nThen summarize what you created.]`
         });
     }
 
@@ -533,10 +545,10 @@ function handleStreaming(openaiReq, anthropicReq, res) {
             emitAutoSaveToolCalls();
         }
 
-        // Flush buffered tool calls with path correction
+        // Flush any tool calls still in buffer (short calls that never hit the streaming threshold)
         const wdNorm = workDir ? workDir.replace(/\\/g, '/') : '';
         for (const idx in toolCalls) {
-            if (toolCalls[idx]._buffered && toolCalls[idx].arguments) {
+            if (toolCalls[idx]._buffered && !toolCalls[idx]._flushed && toolCalls[idx].arguments) {
                 let args = toolCalls[idx].arguments;
                 try {
                     const parsed = JSON.parse(args);
@@ -549,23 +561,25 @@ function handleStreaming(openaiReq, anthropicReq, res) {
                             args = JSON.stringify(parsed);
                         }
                     }
-                    // Fix paths in Bash commands too
                     if (parsed.command && wdNorm && toolCalls[idx].name === 'Bash') {
-                        const cmd = parsed.command;
-                        // Replace wrong absolute paths pointing to /home/... or other wrong locations
-                        const badPathRe = /(?:\/home\/[^\s'"]*|\/tmp\/[^\s'"]*|\/root\/[^\s'"]*)([\w\-]+\.\w{1,10})/g;
-                        const fixed = cmd.replace(badPathRe, (match, filename) => wdNorm + '/' + filename);
-                        if (fixed !== cmd) {
-                            parsed.command = fixed;
-                            log(`  Bash path fix: ${cmd.substring(0, 60)} → ${fixed.substring(0, 60)}`, 'yellow');
-                            args = JSON.stringify(parsed);
+                        const wdParts = wdNorm.split('/');
+                        const wdTail = wdParts.slice(-2).join('/');
+                        const tailEscaped = wdTail.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                        const tailRe = new RegExp('[/\\\\a-zA-Z:]*[/\\\\]' + tailEscaped, 'g');
+                        const fixed = args.replace(tailRe, wdNorm);
+                        if (fixed !== args) {
+                            log(`  Bash path fix applied`, 'yellow');
+                            args = fixed;
                         }
                     }
                 } catch (e) { /* partial JSON, send as-is */ }
-                sse('content_block_delta', {
-                    type: 'content_block_delta', index: toolBlockIndices[idx],
-                    delta: { type: 'input_json_delta', partial_json: args }
-                });
+                const CHUNK = 8000;
+                for (let i = 0; i < args.length; i += CHUNK) {
+                    sse('content_block_delta', {
+                        type: 'content_block_delta', index: toolBlockIndices[idx],
+                        delta: { type: 'input_json_delta', partial_json: args.substring(i, i + CHUNK) }
+                    });
+                }
             }
         }
 
@@ -658,8 +672,9 @@ function handleStreaming(openaiReq, anthropicReq, res) {
 
                 toolCalls[idx] = { id: tc.id, name, arguments: '' };
                 toolBlockIndices[idx] = nextBlockIndex++;
-                // Buffer file tools + Bash for path correction; stream others immediately
+                // Smart buffer: only buffer until file_path is captured, then stream the rest
                 toolCalls[idx]._buffered = ['Write', 'Edit', 'Read', 'Bash'].includes(name);
+                toolCalls[idx]._flushed = false;
                 sse('content_block_start', {
                     type: 'content_block_start', index: toolBlockIndices[idx],
                     content_block: { type: 'tool_use', id: tc.id, name, input: {} }
@@ -667,7 +682,61 @@ function handleStreaming(openaiReq, anthropicReq, res) {
             }
             if (tc.function?.arguments && toolCalls[idx] && !toolCalls[idx]._overridden) {
                 toolCalls[idx].arguments += tc.function.arguments;
-                if (!toolCalls[idx]._buffered) {
+
+                if (toolCalls[idx]._buffered && !toolCalls[idx]._flushed) {
+                    // Still buffering — check if we've captured the file_path/command
+                    const acc = toolCalls[idx].arguments;
+                    const pathCaptured = acc.includes('"content"') || acc.includes('"old_string"') ||
+                                         acc.includes('"command"') || acc.length > 500;
+                    if (pathCaptured) {
+                        // Fix the path in accumulated args and flush
+                        let fixedAcc = acc;
+                        const wdN = workDir ? workDir.replace(/\\/g, '/') : '';
+                        try {
+                            // Quick path fix in the accumulated portion
+                            if (wdN) {
+                                // Fix file_path
+                                fixedAcc = fixedAcc.replace(/"file_path"\s*:\s*"([^"]+)"/, (match, fp) => {
+                                    const fpNorm = fp.replace(/\\/g, '/');
+                                    if (!fpNorm.startsWith(wdN)) {
+                                        const filename = path.basename(fpNorm);
+                                        const fixed = wdN + '/' + filename;
+                                        log(`  Path fix: ${fpNorm} → ${fixed}`, 'yellow');
+                                        return `"file_path":"${fixed}"`;
+                                    }
+                                    return match;
+                                });
+                                // Fix Bash command paths
+                                if (toolCalls[idx].name === 'Bash') {
+                                    const wdParts = wdN.split('/');
+                                    const wdTail = wdParts.slice(-2).join('/');
+                                    const tailEscaped = wdTail.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                                    const tailRe = new RegExp('[/\\\\a-zA-Z:]*[/\\\\]' + tailEscaped, 'g');
+                                    const before = fixedAcc;
+                                    fixedAcc = fixedAcc.replace(tailRe, wdN);
+                                    if (fixedAcc !== before) log(`  Bash path fix applied`, 'yellow');
+                                }
+                            }
+                        } catch (e) { /* use original */ }
+                        // Send the fixed accumulated portion
+                        sse('content_block_delta', {
+                            type: 'content_block_delta', index: toolBlockIndices[idx],
+                            delta: { type: 'input_json_delta', partial_json: fixedAcc }
+                        });
+                        toolCalls[idx]._flushed = true;
+                        toolCalls[idx]._buffered = false;
+                        log(`  Buffer flushed → streaming mode (${acc.length} chars buffered)`, 'dim');
+                    } else {
+                        res.write(': keepalive\n\n');
+                    }
+                } else if (toolCalls[idx]._flushed) {
+                    // Already flushed — stream directly
+                    sse('content_block_delta', {
+                        type: 'content_block_delta', index: toolBlockIndices[idx],
+                        delta: { type: 'input_json_delta', partial_json: tc.function.arguments }
+                    });
+                } else {
+                    // Not buffered at all — stream directly
                     sse('content_block_delta', {
                         type: 'content_block_delta', index: toolBlockIndices[idx],
                         delta: { type: 'input_json_delta', partial_json: tc.function.arguments }
